@@ -142,13 +142,15 @@ const Pagination = ({
     totalPages, 
     onPageChange, 
     totalItems, 
-    itemsPerPage 
+    itemsPerPage,
+    onItemsPerPageChange
 }: { 
     currentPage: number, 
     totalPages: number, 
     onPageChange: (page: number) => void,
     totalItems: number,
-    itemsPerPage: number
+    itemsPerPage: number,
+    onItemsPerPageChange: (limit: number) => void
 }) => {
     const startItem = ((currentPage - 1) * itemsPerPage) + 1;
     const endItem = Math.min(currentPage * itemsPerPage, totalItems);
@@ -157,8 +159,21 @@ const Pagination = ({
 
     return (
         <div className="flex flex-col sm:flex-row justify-between items-center gap-4 py-4 px-2 border-t border-gray-200 dark:border-slate-700 mt-4">
-            <div className="text-sm text-gray-500 dark:text-gray-400">
-                Mostrando <span className="font-bold text-gray-800 dark:text-white">{startItem}</span> a <span className="font-bold text-gray-800 dark:text-white">{endItem}</span> de <span className="font-bold text-gray-800 dark:text-white">{totalItems}</span> resultados
+            <div className="flex flex-col sm:flex-row items-center gap-4">
+                <div className="text-sm text-gray-500 dark:text-gray-400">
+                    Mostrando <span className="font-bold text-gray-800 dark:text-white">{startItem}</span> a <span className="font-bold text-gray-800 dark:text-white">{endItem}</span> de <span className="font-bold text-gray-800 dark:text-white">{totalItems}</span>
+                </div>
+                <select
+                    value={itemsPerPage}
+                    onChange={(e) => onItemsPerPageChange(Number(e.target.value))}
+                    className="bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg text-sm py-1.5 px-3 focus:ring-2 focus:ring-secullum-blue outline-none cursor-pointer text-gray-700 dark:text-gray-200"
+                >
+                    <option value={12}>12 por página</option>
+                    <option value={50}>50 por página</option>
+                    <option value={100}>100 por página</option>
+                    <option value={500}>500 por página</option>
+                    <option value={2000}>2000 (Todos)</option>
+                </select>
             </div>
             
             <div className="flex items-center gap-1">
@@ -235,7 +250,7 @@ const App: React.FC = () => {
   const [listViewMode, setListViewMode] = useState<'grid' | 'table' | 'board'>('grid');
   const [viewAllMode, setViewAllMode] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 12;
+  const [itemsPerPage, setItemsPerPage] = useState(12);
 
   const [filters, setFilters] = useState<FilterState>({
     search: '',
@@ -282,28 +297,62 @@ const App: React.FC = () => {
   const fetchData = async () => {
     setIsLoading(true);
     try {
-        // Fetch FAQs
-        const { data: faqData, error: faqError } = await supabase
-            .from('faq_items')
-            .select('*')
-            .order('created_at', { ascending: false });
+        // Fetch FAQs - Loop to get all records, bypassing 1000 row limit
+        let allFaqData: any[] = [];
+        let page = 0;
+        const PAGE_SIZE = 1000;
+        let hasMore = true;
+        let fetchError = null;
 
-        if (faqError) {
+        while (hasMore) {
+            const from = page * PAGE_SIZE;
+            const to = from + PAGE_SIZE - 1;
+            
+            const { data, error } = await supabase
+                .from('faq_items')
+                .select('*')
+                .order('created_at', { ascending: false })
+                .range(from, to);
+
+            if (error) {
+                fetchError = error;
+                break;
+            }
+
+            if (data && data.length > 0) {
+                allFaqData = [...allFaqData, ...data];
+                if (data.length < PAGE_SIZE) {
+                    hasMore = false;
+                } else {
+                    page++;
+                }
+            } else {
+                hasMore = false;
+            }
+
+            // Safety break to prevent infinite loops (e.g. max 20k items)
+            if (allFaqData.length >= 20000) {
+                console.warn('Reached safety limit of 20000 items');
+                hasMore = false;
+            }
+        }
+
+        if (fetchError) {
             // Check for missing table error (PGRST205 or 42P01)
-            if (faqError.code === 'PGRST205' || faqError.code === '42P01') {
+            if (fetchError.code === 'PGRST205' || fetchError.code === '42P01') {
                 console.warn("Supabase tables not found. Using demo data.");
                 setItems(INITIAL_DATA);
                 setIsDemoMode(true);
                 setToast({ message: 'Conectado ao Supabase, mas tabelas não encontradas. Exibindo dados de exemplo.', type: 'error' }); 
             } else {
-                console.error("Error fetching FAQs:", JSON.stringify(faqError, null, 2));
+                console.error("Error fetching FAQs:", JSON.stringify(fetchError, null, 2));
                 setToast({ message: 'Erro ao carregar perguntas.', type: 'error' });
                 setItems([]);
             }
         } else {
             setIsDemoMode(false);
             // Map snake_case DB to camelCase Typescript
-            const mappedItems: FAQItem[] = (faqData || []).map((i: any) => ({
+            const mappedItems: FAQItem[] = allFaqData.map((i: any) => ({
                 id: i.id,
                 pfNumber: i.pf_number,
                 url: i.url,
@@ -322,7 +371,10 @@ const App: React.FC = () => {
                 createdAt: Number(i.created_at),
                 history: i.history || []
             }));
-            setItems(mappedItems);
+            
+            // Remove potential duplicates if any
+            const uniqueItems = Array.from(new Map(mappedItems.map(item => [item.id, item])).values());
+            setItems(uniqueItems);
         }
 
         // Fetch Systems
@@ -430,17 +482,39 @@ const App: React.FC = () => {
       const matchesVideo = filters.hasVideo !== null ? item.hasVideo === filters.hasVideo : true;
 
       return matchesSearch && matchesSystem && matchesCategory && matchesType && matchesUpdate && matchesFavorite && matchesReusable && matchesVideo;
+    }).sort((a, b) => {
+        // IMPROVED SORTING: If searching, prioritize matches in PF Number
+        if (searchLower) {
+            // 1. Exact PF Number match
+            const aExact = a.pfNumber.toLowerCase() === searchLower;
+            const bExact = b.pfNumber.toLowerCase() === searchLower;
+            if (aExact && !bExact) return -1;
+            if (!aExact && bExact) return 1;
+
+            // 2. Starts with PF Number
+            const aStart = a.pfNumber.toLowerCase().startsWith(searchLower);
+            const bStart = b.pfNumber.toLowerCase().startsWith(searchLower);
+            if (aStart && !bStart) return -1;
+            if (!aStart && bStart) return 1;
+        }
+        // Default: created_at desc
+        return b.createdAt - a.createdAt;
     });
   }, [items, filters]);
 
   const displayedItems = useMemo(() => {
     const startIndex = (currentPage - 1) * itemsPerPage;
     return filteredItems.slice(startIndex, startIndex + itemsPerPage);
-  }, [filteredItems, currentPage, viewAllMode, listViewMode]);
+  }, [filteredItems, currentPage, viewAllMode, listViewMode, itemsPerPage]);
 
   const totalPages = Math.ceil(filteredItems.length / itemsPerPage);
 
   // --- HANDLERS ---
+  const handleItemsPerPageChange = (newLimit: number) => {
+    setItemsPerPage(newLimit);
+    setCurrentPage(1);
+  };
+
   const getSystemColor = (systemName: string) => {
     if (systemColors[systemName]) {
         return systemColors[systemName];
@@ -1549,6 +1623,7 @@ const App: React.FC = () => {
                         totalItems={filteredItems.length}
                         itemsPerPage={itemsPerPage}
                         onPageChange={setCurrentPage}
+                        onItemsPerPageChange={handleItemsPerPageChange}
                     />
                 )}
 
@@ -1682,61 +1757,6 @@ const App: React.FC = () => {
                      <button onClick={() => handleSave(false)} disabled={isSaving} className="w-full bg-secullum-green hover:bg-green-600 text-white py-3 rounded-xl font-bold shadow-lg shadow-green-900/10 transition-all hover:scale-[1.02] active:scale-95 flex items-center justify-center gap-2">{isSaving ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />} Salvar Alterações</button>
                      <button onClick={() => setIsModalOpen(false)} className="w-full py-2 text-xs font-bold text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors">Cancelar</button>
                 </div>
-            </div>
-        </div>
-      </Modal>
-
-      <Modal isOpen={isQuickAddOpen} onClose={() => setIsQuickAddOpen(false)} title="Adicionar PF Rápida">
-         <div className="space-y-5">
-             <div><label className="block text-sm font-bold text-gray-700 dark:text-gray-300 mb-1">Número da PF <span className="text-rose-500">*</span></label><input type="text" value={formData.pfNumber || ''} onChange={e => setFormData({...formData, pfNumber: e.target.value})} autoFocus className="w-full bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-secullum-blue outline-none font-mono" /></div>
-             <div><label className="block text-sm font-bold text-gray-700 dark:text-gray-300 mb-1">Pergunta <span className="text-rose-500">*</span></label><input type="text" value={formData.question || ''} onChange={e => setFormData({...formData, question: e.target.value})} className="w-full bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-secullum-blue outline-none" /></div>
-             <div className="grid grid-cols-2 gap-4">
-                 <div><label className="block text-sm font-bold text-gray-700 dark:text-gray-300 mb-1">Sistema</label><select value={formData.system} onChange={e => setFormData({...formData, system: e.target.value as SystemType})} className="w-full bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-secullum-blue outline-none">{systems.map(s => <option key={s} value={s}>{s}</option>)}</select></div>
-                <div><label className="block text-sm font-bold text-gray-700 dark:text-gray-300 mb-1">Tipo</label><select value={formData.type} onChange={e => setFormData({...formData, type: e.target.value as PType})} className="w-full bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-secullum-blue outline-none">{types.map(t => <option key={t} value={t}>{t}</option>)}</select></div>
-             </div>
-             <div className="flex justify-end gap-3 pt-4"><button onClick={() => setIsQuickAddOpen(false)} className="px-6 py-2.5 rounded-lg text-sm font-bold text-gray-500 hover:text-gray-700 dark:text-gray-400">Cancelar</button><button onClick={() => handleSave(true)} className="bg-sky-500 hover:bg-sky-600 text-white px-8 py-2.5 rounded-lg text-sm font-bold shadow-lg shadow-sky-900/20 transition-all">Salvar Rápido</button></div>
-         </div>
-      </Modal>
-
-      <Modal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} title="Configurações do Sistema">
-        <div className="space-y-8">
-            <div>
-                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-4 border-b border-gray-200 dark:border-slate-700 pb-2">Sistemas Cadastrados</h3>
-                <div className="flex gap-2 mb-4"><input type="text" value={newSystemName} onChange={e => setNewSystemName(e.target.value)} placeholder="Novo Sistema..." className="flex-1 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm focus:ring-2 focus:ring-secullum-blue outline-none" /><button onClick={handleAddSystem} className="bg-secullum-green text-white px-4 py-2 rounded-lg font-bold"><Plus size={18}/></button></div>
-                <div className="flex flex-col gap-2">
-                    {systems.map(sys => (
-                        <div key={sys} className="bg-slate-100 dark:bg-slate-700/50 px-3 py-2 rounded-lg text-sm flex items-center justify-between border border-slate-200 dark:border-slate-600">
-                             <div className="flex items-center gap-3">
-                                 <span className="font-medium text-gray-700 dark:text-gray-200">{sys}</span>
-                             </div>
-                             <div className="flex items-center gap-3">
-                                <div className="relative group">
-                                     <select 
-                                        value={getSystemColor(sys)} 
-                                        onChange={(e) => handleSystemColorChange(sys, e.target.value)}
-                                        className="appearance-none w-24 bg-white dark:bg-slate-800 border border-gray-300 dark:border-slate-600 text-xs rounded-md pl-2 pr-6 py-1 focus:ring-1 focus:ring-secullum-blue outline-none cursor-pointer"
-                                     >
-                                         {AVAILABLE_COLORS.map(c => (
-                                             <option key={c.key} value={c.key}>{c.label}</option>
-                                         ))}
-                                     </select>
-                                     <div className={`absolute top-1/2 -translate-y-1/2 right-2 w-3 h-3 rounded-full pointer-events-none border border-black/10`} style={{ backgroundColor: AVAILABLE_COLORS.find(c => c.key === getSystemColor(sys))?.hex }}></div>
-                                </div>
-                                <button onClick={(e) => handleRemoveSystem(sys, e)} className="text-gray-400 hover:text-rose-500 p-1"><X size={16} /></button>
-                             </div>
-                        </div>
-                    ))}
-                </div>
-            </div>
-            <div>
-                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-4 border-b border-gray-200 dark:border-slate-700 pb-2">Categorias</h3>
-                <div className="flex gap-2 mb-4"><input type="text" value={newCategoryName} onChange={e => setNewCategoryName(e.target.value)} placeholder="Nova Categoria..." className="flex-1 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm focus:ring-2 focus:ring-secullum-blue outline-none" /><button onClick={handleAddCategory} className="bg-secullum-green text-white px-4 py-2 rounded-lg font-bold"><Plus size={18}/></button></div>
-                <div className="flex flex-wrap gap-2">{categories.map(cat => (<div key={cat} className="bg-slate-100 dark:bg-slate-700/50 px-3 py-1.5 rounded-lg text-sm flex items-center gap-2 border border-slate-200 dark:border-slate-600">{cat}<button onClick={(e) => handleRemoveCategory(cat, e)} className="text-gray-400 hover:text-rose-500"><X size={14} /></button></div>))}</div>
-            </div>
-            <div>
-                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-4 border-b border-gray-200 dark:border-slate-700 pb-2">Tipos de PF</h3>
-                <div className="flex gap-2 mb-4"><input type="text" value={newTypeName} onChange={e => setNewTypeName(e.target.value)} placeholder="Novo Tipo..." className="flex-1 bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm focus:ring-2 focus:ring-secullum-blue outline-none" /><button onClick={handleAddType} className="bg-secullum-green text-white px-4 py-2 rounded-lg font-bold"><Plus size={18}/></button></div>
-                <div className="flex flex-wrap gap-2">{types.map(t => (<div key={t} className="bg-slate-100 dark:bg-slate-700/50 px-3 py-1.5 rounded-lg text-sm flex items-center gap-2 border border-slate-200 dark:border-slate-600">{t}<button onClick={(e) => handleRemoveType(t, e)} className="text-gray-400 hover:text-rose-500"><X size={14} /></button></div>))}</div>
             </div>
         </div>
       </Modal>
